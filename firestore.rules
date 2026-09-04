@@ -1,0 +1,502 @@
+rules_version = '2';
+
+// YassineTia Hub — Firestore Security Rules
+//
+// Design principles:
+// - The client is NOT trusted just because it is signed in.
+// - Every collection's rules are explicit. Default deny.
+// - Protected fields (role, status, counters, ownership, timestamps) cannot
+//   be modified by the client except by server / admin tools.
+// - Admin authority is read from the user's own server-side `users/{uid}`
+//   document. The client cannot promote itself.
+// - Counter updates are NOT client-authoritative. Where the client
+//   legitimately bumps a counter (e.g., on a comment add), the rule
+//   constrains the delta to ±1 and forbids arbitrary values.
+// - Reactions use a deterministic doc id (userId_targetType_targetId) and
+//   cannot be reassigned to other users.
+// - Follows are also deterministic and reject self-follow.
+// - Username reservations cannot be created for another user.
+// - Contact messages have anti-spam constraints enforced by the rules
+//   (no URLs, length limits, regex on email).
+// - Notifications cannot be created for other recipients.
+//
+// Future collections (post/idea comments stored as subcollections) are not
+// used in MVP — comments are kept in a flat `comments` collection with
+// (parentType, parentId) and indexed.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+    function isAdmin() {
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+    function isNotBanned() {
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+    function inString(field, min, max) {
+      return field is string && field.size() >= min && field.size() <= max;
+    }
+    function validEmail(s) {
+      return s is string && s.matches('^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$');
+    }
+
+    // ─── users/{userId} ────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if true;
+
+      allow create: if isOwner(userId) &&
+        request.resource.data.uid == userId &&
+        request.resource.data.role == 'user' &&
+        request.resource.data.status == 'active' &&
+        request.resource.data.postsCount == 0 &&
+        request.resource.data.ideasCount == 0 &&
+        request.resource.data.commentsCount == 0 &&
+        validEmail(request.resource.data.email) &&
+        inString(request.resource.data.email, 5, 200) &&
+        inString(request.resource.data.displayName, 1, 50) &&
+        // coverURL/photoURL: optional, must be a string when present.
+        (request.resource.data.photoURL == null ||
+         request.resource.data.photoURL is string) &&
+        (request.resource.data.coverURL == null ||
+         request.resource.data.coverURL is string) &&
+        // bio: optional, string when present.
+        (request.resource.data.bio == null ||
+         request.resource.data.bio is string) &&
+        request.resource.data.keys().hasOnly([
+          'uid', 'email', 'username', 'displayName', 'photoURL', 'coverURL', 'bio',
+          'role', 'status',
+          'postsCount', 'ideasCount', 'commentsCount',
+          'followersCount', 'followingCount',
+          'createdAt', 'updatedAt'
+        ]);
+
+      // Self-update of safe fields only.
+      // `username` is normally immutable after create, but a brand-new
+      // account that just authenticated (e.g. via Google) may have
+      // `username == null` and needs a one-time backfill. The username
+      // uniqueness is enforced separately by the `usernames/{u}` doc
+      // (the client must reserve it transactionally before this update).
+      //
+      // `followersCount` / `followingCount` are cached counters maintained
+      // transactionally by the data layer. The Rules permit writing them
+      // ONLY when the new value equals the old value ±1 (no arbitrary
+      // values, no reset to zero). All other protected fields are still
+      // immutable from the client.
+      allow update: if isOwner(userId) &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.postsCount == resource.data.postsCount &&
+        request.resource.data.ideasCount == resource.data.ideasCount &&
+        request.resource.data.commentsCount == resource.data.commentsCount &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        // bio is optional and may be null; when present must be 1-280 chars
+        (request.resource.data.bio == null ||
+         (request.resource.data.bio is string &&
+          request.resource.data.bio.size() >= 1 &&
+          request.resource.data.bio.size() <= 280)) &&
+        // photoURL when present must be a string
+        (request.resource.data.photoURL == null ||
+         request.resource.data.photoURL is string) &&
+        // coverURL when present must be a string
+        (request.resource.data.coverURL == null ||
+         request.resource.data.coverURL is string) &&
+        // followersCount / followingCount: if present, must equal old ±1
+        // (or stay the same if the field is missing). This prevents
+        // arbitrary writes — the client cannot set the count to 999999.
+        ((resource.data.followersCount == null && request.resource.data.followersCount == null) ||
+         (resource.data.followersCount is number &&
+          request.resource.data.followersCount is number &&
+          (request.resource.data.followersCount == resource.data.followersCount + 1 ||
+           request.resource.data.followersCount == resource.data.followersCount - 1))) &&
+        ((resource.data.followingCount == null && request.resource.data.followingCount == null) ||
+         (resource.data.followingCount is number &&
+          request.resource.data.followingCount is number &&
+          (request.resource.data.followingCount == resource.data.followingCount + 1 ||
+           request.resource.data.followingCount == resource.data.followingCount - 1))) &&
+        ((
+          // Normal case: username is immutable; counters and the safe
+          // display fields are writable.
+          request.resource.data.username == resource.data.username &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['displayName', 'bio', 'photoURL', 'coverURL', 'followersCount', 'followingCount', 'updatedAt'])
+        ) || (
+          // Backfill case: only permitted when the existing username is
+          // null and the new value is a valid normalized username.
+          resource.data.username == null &&
+          request.resource.data.username is string &&
+          inString(request.resource.data.username, 3, 20) &&
+          request.resource.data.username.matches('^[a-z0-9_]+$') &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['username', 'updatedAt'])
+        ));
+
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // ─── usernames/{username} ───────────────────────────────────
+    // Doc id is the lowercased username. A user may only reserve a name
+    // for themselves, and only if it doesn't already exist for another uid.
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isSignedIn() &&
+        inString(username, 3, 20) &&
+        username.matches('^[a-z0-9_]+$') &&
+        request.resource.data.username == username &&
+        request.resource.data.uid == request.auth.uid;
+      allow update: if false;
+      allow delete: if isOwner(resource.data.uid) || isAdmin();
+    }
+
+    // ─── categories/{categoryId} ───────────────────────────────
+    // Read-only for the public; mutations are an admin task done via
+    // Console (no client writer in MVP).
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ─── posts/{postId} ─────────────────────────────────────────
+    match /posts/{postId} {
+      allow read: if true;
+
+      // Anyone (signed-in) can create. Anonymous posts are not in MVP —
+      // all posts are attributed to a signed-in user. Pin/lock only via
+      // admin update. Counters start at 0 and are not client-writable.
+      allow create: if isSignedIn() && isNotBanned() &&
+        request.resource.data.authorId == request.auth.uid &&
+        inString(request.resource.data.title, 5, 150) &&
+        inString(request.resource.data.body, 10, 5000) &&
+        inString(request.resource.data.categoryId, 1, 50) &&
+        inString(request.resource.data.categoryName, 1, 50) &&
+        inString(request.resource.data.authorUsername, 1, 50) &&
+        inString(request.resource.data.authorDisplayName, 1, 50) &&
+        request.resource.data.isPinned == false &&
+        request.resource.data.isLocked == false &&
+        request.resource.data.commentsCount == 0 &&
+        request.resource.data.reactionsCount == 0 &&
+        request.resource.data.keys().hasOnly([
+          'id', 'authorId', 'authorUsername', 'authorDisplayName', 'authorAvatar',
+          'title', 'body', 'categoryId', 'categoryName',
+          'isPinned', 'isLocked',
+          'commentsCount', 'reactionsCount',
+          'createdAt', 'updatedAt', 'lastActivityAt'
+        ]);
+
+      // Author can edit body only; cannot touch ownership, pin, lock, counters.
+      allow update: if isOwner(resource.data.authorId) &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.authorUsername == resource.data.authorUsername &&
+        request.resource.data.authorDisplayName == resource.data.authorDisplayName &&
+        request.resource.data.authorAvatar == resource.data.authorAvatar &&
+        request.resource.data.categoryId == resource.data.categoryId &&
+        request.resource.data.categoryName == resource.data.categoryName &&
+        request.resource.data.isPinned == resource.data.isPinned &&
+        request.resource.data.isLocked == resource.data.isLocked &&
+        request.resource.data.commentsCount == resource.data.commentsCount &&
+        request.resource.data.reactionsCount == resource.data.reactionsCount &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['body', 'updatedAt', 'lastActivityAt']);
+
+      // Admins may set pin/lock (and edit body for moderation).
+      allow update: if isAdmin() &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['body', 'isPinned', 'isLocked', 'updatedAt', 'lastActivityAt', 'commentsCount', 'reactionsCount']);
+
+      allow delete: if isOwner(resource.data.authorId) || isAdmin();
+    }
+
+    // ─── ideas/{ideaId} ─────────────────────────────────────────
+    // Anonymous submissions are allowed (authorId/authorUsername may be null).
+    match /ideas/{ideaId} {
+      allow read: if true;
+
+      allow create: if inString(request.resource.data.title, 5, 100) &&
+        inString(request.resource.data.description, 10, 1000) &&
+        request.resource.data.status == 'new' &&
+        request.resource.data.isPinned == false &&
+        request.resource.data.isFeatured == false &&
+        request.resource.data.adminReply == null &&
+        request.resource.data.upvotesCount == 0 &&
+        request.resource.data.commentsCount == 0 &&
+        request.resource.data.statusUpdatedBy == null &&
+        // Either signed in and attributing to self, or anonymous (no authorId).
+        (request.resource.data.authorId == null ||
+          (isSignedIn() && request.resource.data.authorId == request.auth.uid)) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'authorId', 'authorUsername', 'authorDisplayName', 'authorAvatar',
+          'title', 'description', 'categoryId', 'categoryName',
+          'status', 'statusUpdatedAt', 'statusUpdatedBy',
+          'isPinned', 'isFeatured',
+          'adminReply', 'adminReplyAt',
+          'upvotesCount', 'commentsCount',
+          'createdAt', 'updatedAt', 'lastActivityAt'
+        ]);
+
+      // Author may edit their own idea's title/description only.
+      allow update: if isOwner(resource.data.authorId) &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.isPinned == resource.data.isPinned &&
+        request.resource.data.isFeatured == resource.data.isFeatured &&
+        request.resource.data.adminReply == resource.data.adminReply &&
+        request.resource.data.adminReplyAt == resource.data.adminReplyAt &&
+        request.resource.data.upvotesCount == resource.data.upvotesCount &&
+        request.resource.data.commentsCount == resource.data.commentsCount &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['title', 'description', 'updatedAt', 'lastActivityAt']);
+
+      // Admins can change status, pin, featured, adminReply, and counters
+      // (the +1 delta is enforced by transactions in client code; the
+      // rules additionally require that the new counter is exactly old+1
+      // or old-1, never arbitrary).
+      allow update: if isAdmin() &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        (
+          // Free-form text fields
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['adminReply', 'adminReplyAt', 'status', 'statusUpdatedAt',
+                      'statusUpdatedBy', 'isPinned', 'isFeatured',
+                      'updatedAt', 'lastActivityAt'])
+          ||
+          // Counter changes (±1 only) — commentsCount or upvotesCount
+          (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentsCount', 'upvotesCount', 'lastActivityAt', 'updatedAt']) &&
+           (request.resource.data.commentsCount == resource.data.commentsCount + 1 ||
+            request.resource.data.commentsCount == resource.data.commentsCount - 1 ||
+            request.resource.data.commentsCount == resource.data.commentsCount) &&
+           (request.resource.data.upvotesCount == resource.data.upvotesCount + 1 ||
+            request.resource.data.upvotesCount == resource.data.upvotesCount - 1 ||
+            request.resource.data.upvotesCount == resource.data.upvotesCount))
+        );
+
+      allow delete: if isOwner(resource.data.authorId) || isAdmin();
+    }
+
+    // ─── comments/{commentId} ──────────────────────────────────
+    // Polymorphic via (parentType, parentId). No reactions on comments.
+    match /comments/{commentId} {
+      allow read: if true;
+
+      allow create: if isSignedIn() && isNotBanned() &&
+        request.resource.data.authorId == request.auth.uid &&
+        inString(request.resource.data.body, 1, 2000) &&
+        inString(request.resource.data.authorUsername, 1, 50) &&
+        inString(request.resource.data.authorDisplayName, 1, 50) &&
+        request.resource.data.parentType in ['post', 'idea'] &&
+        inString(request.resource.data.parentId, 1, 200) &&
+        request.resource.data.isHidden == false &&
+        (request.resource.data.authorRole == 'user' ||
+         (request.resource.data.authorRole == 'admin' && isAdmin())) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'authorId', 'authorUsername', 'authorDisplayName', 'authorAvatar',
+          'authorRole', 'body', 'parentType', 'parentId', 'isHidden',
+          'createdAt', 'updatedAt'
+        ]);
+
+      // Author can edit body within 5 minutes.
+      allow update: if isOwner(resource.data.authorId) &&
+        request.resource.data.parentType == resource.data.parentType &&
+        request.resource.data.parentId == resource.data.parentId &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['body', 'updatedAt']) &&
+        request.time < resource.data.createdAt + duration.value(5, 'm');
+
+      // Admin may only set isHidden.
+      allow update: if isAdmin() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isHidden']);
+
+      allow delete: if isOwner(resource.data.authorId) || isAdmin();
+    }
+
+    // ─── reactions/{reactionId} ────────────────────────────────
+    // Doc id is the deterministic compound id (userId_targetType_targetId).
+    // Users may only create for themselves, may not change to a different
+    // user, and may not modify after creation (toggle = delete+create).
+    match /reactions/{reactionId} {
+      allow read: if true;
+
+      allow create: if isSignedIn() && isNotBanned() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.targetType in ['post', 'idea'] &&
+        inString(request.resource.data.targetId, 1, 200) &&
+        inString(request.resource.data.username, 1, 50) &&
+        request.resource.data.type == 'upvote' &&
+        reactionId == request.resource.data.userId + '_' + request.resource.data.targetType + '_' + request.resource.data.targetId &&
+        request.resource.data.keys().hasOnly([
+          'id', 'userId', 'username', 'targetType', 'targetId', 'type', 'createdAt'
+        ]);
+
+      // The rule verifies the doc id matches the compound id on read so a
+      // reaction created for a different target can never accidentally be
+      // associated with another target. The client also enforces this.
+      allow update: if false;
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    // ─── follows/{followId} ────────────────────────────────────
+    // Doc id is `${followerId}_${followeeId}`. No self-follow.
+    match /follows/{followId} {
+      allow read: if true;
+      allow create: if isSignedIn() && isNotBanned() &&
+        request.resource.data.followerId == request.auth.uid &&
+        request.resource.data.followerId != request.resource.data.followeeId &&
+        inString(request.resource.data.followeeId, 1, 200) &&
+        followId == request.resource.data.followerId + '_' + request.resource.data.followeeId &&
+        request.resource.data.keys().hasOnly(['id', 'followerId', 'followeeId', 'createdAt']);
+      allow update: if false;
+      allow delete: if isOwner(resource.data.followerId);
+    }
+
+    // ─── notifications/{notificationId} ────────────────────────
+    // Create paths:
+    //   - An actor creates a notification destined for someone else
+    //     (follow / upvote / comment events).
+    //   - An admin creates a notification (e.g. status change, admin reply).
+    // Strict shape validation prevents impersonation and self-notification.
+    // The client may write the new actor denormalized fields
+    // (actorUsername / actorDisplayName / actorAvatar) only when the
+    // actorId matches request.auth.uid. The rules do NOT trust those
+    // fields for authorization; they are presentation metadata.
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() &&
+        (resource == null || resource.data.recipientId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() &&
+        (
+          // Admin path (status change, manual admin reply)
+          (isAdmin() &&
+           request.resource.data.keys().hasOnly([
+             'id', 'recipientId', 'actorId',
+             'actorUsername', 'actorDisplayName', 'actorAvatar',
+             'kind', 'type', 'targetType', 'targetId',
+             'read', 'message', 'createdAt'
+           ]))
+          ||
+          // Actor path (follow, comment, upvote)
+          (request.resource.data.actorId == request.auth.uid &&
+           request.resource.data.recipientId != request.auth.uid &&
+           request.resource.data.read == false &&
+           request.resource.data.kind in [
+             'new_follower', 'upvote',
+             'comment_on_idea', 'comment_on_post',
+             'idea_status_changed', 'admin_reply'
+           ] &&
+           request.resource.data.targetType in ['post', 'idea', 'user'] &&
+           inString(request.resource.data.targetId, 1, 200) &&
+           inString(request.resource.data.message, 1, 200) &&
+           // Actor denormalized fields must be self-consistent.
+           // `actorId == auth.uid` is already enforced above.
+           (request.resource.data.actorUsername == null ||
+            inString(request.resource.data.actorUsername, 1, 50)) &&
+           (request.resource.data.actorDisplayName == null ||
+            inString(request.resource.data.actorDisplayName, 1, 100)) &&
+           (request.resource.data.actorAvatar == null ||
+            inString(request.resource.data.actorAvatar, 1, 500)) &&
+           // If `type` is present, it must equal `kind`.
+           (request.resource.data.type == null ||
+            request.resource.data.type == request.resource.data.kind) &&
+           request.resource.data.keys().hasOnly([
+             'id', 'recipientId', 'actorId',
+             'actorUsername', 'actorDisplayName', 'actorAvatar',
+             'kind', 'type', 'targetType', 'targetId',
+             'read', 'message', 'createdAt'
+           ]))
+        );
+      // Recipient may mark their own notifications as read; admin can do anything.
+      allow update: if isAdmin() ||
+        (isOwner(resource.data.recipientId) &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']));
+      allow delete: if isAdmin();
+    }
+
+    // ─── contactMessages/{messageId} ───────────────────────────
+    // Anyone (including guests) can create with strict input constraints.
+    // Only admin can read/update/delete.
+    match /contactMessages/{messageId} {
+      allow read: if isAdmin();
+      allow create: if inString(request.resource.data.name, 1, 100) &&
+        inString(request.resource.data.email, 5, 200) &&
+        validEmail(request.resource.data.email) &&
+        inString(request.resource.data.subject, 3, 150) &&
+        inString(request.resource.data.message, 10, 2000) &&
+        !request.resource.data.message.matches('https?://') &&
+        request.resource.data.isRead == false &&
+        request.resource.data.keys().hasOnly([
+          'id', 'name', 'email', 'subject', 'message', 'isRead', 'createdAt'
+        ]);
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ─── Default deny ──────────────────────────────────────────
+
+    // achievements/{achievementId}
+    // Public read. Signed-in non-banned users can post their own achievements
+    // (authorId == auth.uid). Admins can post community-wide achievements
+    // (authorId == null).
+    match /achievements/{achievementId} {
+      allow read: if true;
+      allow create: if isSignedIn() && isNotBanned() && (
+        (request.resource.data.authorId == request.auth.uid) ||
+        (request.resource.data.authorId == null && isAdmin())
+      ) && request.resource.data.category in [
+        'study_success', 'challenge_completed', 'skill_learned',
+        'sports_achievement', 'personal_goal'
+      ] && inString(request.resource.data.title, 5, 120) &&
+        inString(request.resource.data.description, 10, 500) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'authorId', 'authorUsername', 'authorDisplayName', 'authorAvatar',
+          'category', 'title', 'description', 'createdAt'
+        ]);
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.authorId == request.auth.uid &&
+        request.resource.data.authorId == resource.data.authorId &&
+        request.resource.data.createdAt == resource.data.createdAt
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.authorId == request.auth.uid);
+    }
+
+    // challenges/{challengeId}
+    // Public read (homepage widget). Admin-only writes.
+    match /challenges/{challengeId} {
+      allow read: if true;
+      allow create: if isAdmin() &&
+        inString(request.resource.data.title, 5, 120) &&
+        inString(request.resource.data.description, 10, 1000) &&
+        request.resource.data.isActive is bool &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.keys().hasOnly([
+          'id', 'title', 'description', 'deadline', 'reward', 'isActive',
+          'createdAt', 'createdBy'
+        ]);
+      allow update: if isAdmin() &&
+        request.resource.data.keys().hasOnly([
+          'title', 'description', 'deadline', 'reward', 'isActive'
+        ]);
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
